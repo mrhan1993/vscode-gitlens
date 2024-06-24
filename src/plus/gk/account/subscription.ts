@@ -208,7 +208,20 @@ export function getSubscriptionTimeRemaining(
 	subscription: Optional<Subscription, 'state'>,
 	unit?: 'days' | 'hours' | 'minutes' | 'seconds',
 ): number | undefined {
-	return getTimeRemaining(subscription.plan.effective.expiresOn, unit);
+	const fixedDays = 3650;
+
+	switch (unit) {
+		case 'days':
+			return fixedDays;
+		case 'hours':
+			return fixedDays * 24;
+		case 'minutes':
+			return fixedDays * 24 * 60;
+		case 'seconds':
+			return fixedDays * 24 * 60 * 60;
+		default:
+			return fixedDays * 24 * 60 * 60 * 1000;
+	}
 }
 
 export function getTimeRemaining(

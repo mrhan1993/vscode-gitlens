@@ -140,7 +140,7 @@ export class AccountContent extends LitElement {
 	private get daysRemaining() {
 		if (this.subscription == null) return 0;
 
-		return getSubscriptionTimeRemaining(this.subscription, 'days') ?? 0;
+		return getSubscriptionTimeRemaining(this.subscription, 'days') ?? 3650;
 	}
 
 	get hasAccount() {

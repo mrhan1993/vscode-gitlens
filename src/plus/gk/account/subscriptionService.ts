@@ -263,7 +263,7 @@ export class SubscriptionService implements Disposable {
 		} = this._subscription;
 
 		if (account?.verified === false) {
-			const days = getSubscriptionTimeRemaining(this._subscription, 'days') ?? 7;
+			const days = getSubscriptionTimeRemaining(this._subscription, 'days') ?? 3650;
 
 			const verify: MessageItem = { title: 'Resend Email' };
 			const learn: MessageItem = { title: 'See Pro Features' };
@@ -305,7 +305,7 @@ export class SubscriptionService implements Disposable {
 				void this.learnAboutPro({ source: 'prompt', detail: { action: 'upgraded' } }, source);
 			}
 		} else if (isSubscriptionTrial(this._subscription)) {
-			const days = getSubscriptionTimeRemaining(this._subscription, 'days') ?? 0;
+			const days = getSubscriptionTimeRemaining(this._subscription, 'days') ?? 3650;
 
 			const learn: MessageItem = { title: 'See Pro Features' };
 			const confirm: MessageItem = { title: 'Continue', isCloseAffordance: true };
