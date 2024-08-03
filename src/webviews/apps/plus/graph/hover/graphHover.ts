@@ -3,7 +3,9 @@ import { css, html } from 'lit';
 import { customElement, property } from 'lit/decorators.js';
 import { until } from 'lit/directives/until.js';
 import type { DidGetRowHoverParams } from '../../../../../plus/webviews/graph/protocol';
-import { isPromise } from '../../../../../system/promise';
+import type { Deferrable } from '../../../../../system/function';
+import { debounce } from '../../../../../system/function';
+import { getSettledValue, isPromise } from '../../../../../system/promise';
 import { GlElement } from '../../../shared/components/element';
 import type { GlPopover } from '../../../shared/components/overlays/popover.react';
 import '../../../shared/components/overlays/popover';
@@ -41,15 +43,18 @@ export class GlGraphHover extends GlElement {
 	placement?: GlPopover['placement'] = 'bottom';
 
 	@property({ type: Object })
-	markdown?: Promise<string | undefined> | string | undefined;
+	markdown?: Promise<PromiseSettledResult<string>> | string;
 
 	@property({ reflect: true, type: Number })
 	skidding?: number | undefined;
 
 	@property({ type: Function })
-	requestMarkdown: ((row: GraphRow) => Promise<DidGetRowHoverParams | undefined>) | undefined;
+	requestMarkdown: ((row: GraphRow) => Promise<DidGetRowHoverParams>) | undefined;
 
-	private hoverMarkdownCache = new Map<string, Promise<string> | string>();
+	private hoverMarkdownCache = new Map<
+		string,
+		Promise<PromiseSettledResult<string>> | PromiseSettledResult<string> | string
+	>();
 	private hoveredSha: string | undefined;
 	private unhoverTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -78,10 +83,17 @@ export class GlGraphHover extends GlElement {
 		this.hoverMarkdownCache.clear();
 	}
 
-	onRowHovered(row: GraphRow, anchor: Anchor) {
-		console.log('onRowHovered', row.sha);
+	onParentMouseLeave = () => {
+		this.hide();
+	};
 
+	private _showCoreDebounced: Deferrable<GlGraphHover['showCore']> | undefined = undefined;
+
+	onRowHovered(row: GraphRow, anchor: Anchor) {
+		clearTimeout(this.unhoverTimer);
 		if (this.requestMarkdown == null) return;
+		// Break if we are already showing the hover for the same row
+		if (this.hoveredSha === row.sha && this.open) return;
 
 		this.hoveredSha = row.sha;
 
@@ -90,27 +102,29 @@ export class GlGraphHover extends GlElement {
 			const cache = row.type !== 'work-dir-changes';
 
 			markdown = this.requestMarkdown(row).then(params => {
-				if (params?.markdown != null) {
-					if (cache) {
-						this.hoverMarkdownCache.set(row.sha, params.markdown);
-					}
-					return params.markdown;
+				if (params.markdown.status === 'fulfilled' && cache) {
+					this.hoverMarkdownCache.set(row.sha, params.markdown);
+				} else if (params.markdown.status === 'rejected') {
+					this.hoverMarkdownCache.delete(row.sha);
 				}
 
-				this.hoverMarkdownCache.delete(row.sha);
-				return '';
+				return params.markdown;
 			});
 
 			if (cache) {
 				this.hoverMarkdownCache.set(row.sha, markdown);
 			}
 		}
-		this.showCore(anchor, markdown);
+
+		if (this.open) {
+			this.showCore(anchor, markdown);
+		} else {
+			this._showCoreDebounced ??= debounce(this.showCore.bind(this), 500);
+			this._showCoreDebounced(anchor, markdown);
+		}
 	}
 
 	onRowUnhovered(row: GraphRow, relatedTarget: EventTarget | null) {
-		console.log('onRowUnhovered', row.sha);
-
 		clearTimeout(this.unhoverTimer);
 
 		if (
@@ -121,35 +135,52 @@ export class GlGraphHover extends GlElement {
 			return;
 		}
 
-		this.hoveredSha = undefined;
-
-		this.unhoverTimer = setTimeout(() => {
-			console.log('onRowUnhovered timeout', this.hoveredSha);
-			if (this.hoveredSha == null) {
-				this.hide();
-			}
-		}, 100);
+		this.unhoverTimer = setTimeout(() => this.hide(), 250);
 	}
+
+	onWindowKeydown = (e: KeyboardEvent) => {
+		if (e.key === 'Escape') {
+			e.stopPropagation();
+			this.hide();
+		}
+	};
 
 	private showCore(
 		anchor: string | HTMLElement | { getBoundingClientRect: () => Omit<DOMRect, 'toJSON'> },
-		markdown: Promise<string | undefined> | string | undefined,
+		markdown: Promise<PromiseSettledResult<string>> | PromiseSettledResult<string> | string,
 	) {
-		if (isPromise(markdown)) {
-			void markdown.then(markdown => {
-				this.markdown = markdown;
-				if (!markdown) {
-					this.open = false;
-				}
-			});
+		if (typeof markdown === 'string') {
+			this.markdown = markdown;
+		} else if (isPromise(markdown)) {
+			const previousSha = this.hoveredSha;
+			void markdown
+				.then(markdown => {
+					if (previousSha !== this.hoveredSha) return;
+
+					this.markdown = getSettledValue(markdown);
+					if (!markdown) {
+						this.hide();
+					}
+				})
+				.catch(() => {});
+		} else {
+			this.markdown = getSettledValue(markdown);
 		}
 
 		this.anchor = anchor;
-		this.markdown = markdown;
 		this.open = true;
+		this.parentElement?.addEventListener('mouseleave', this.onParentMouseLeave);
+		window.addEventListener('keydown', this.onWindowKeydown);
 	}
 
 	hide() {
+		this._showCoreDebounced?.cancel();
+		clearTimeout(this.unhoverTimer);
+		this.parentElement?.removeEventListener('mouseleave', this.onParentMouseLeave);
+		window.removeEventListener('keydown', this.onWindowKeydown);
+
+		this.hoveredSha = undefined;
+		this.markdown = undefined;
 		this.open = false;
 	}
 }

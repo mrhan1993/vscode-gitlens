@@ -2,10 +2,11 @@ import type { CancellationToken, Event, MessageItem } from 'vscode';
 import { EventEmitter, window } from 'vscode';
 import type { DynamicAutolinkReference } from '../../annotations/autolinks';
 import type { AutolinkReference } from '../../config';
+import type { Sources } from '../../constants';
 import type { Container } from '../../container';
 import { AuthenticationError, CancellationError, ProviderRequestClientError } from '../../errors';
 import type { PagedResult } from '../../git/gitProvider';
-import type { Account } from '../../git/models/author';
+import type { Account, UnidentifiedAuthor } from '../../git/models/author';
 import type { DefaultBranch } from '../../git/models/defaultBranch';
 import type { IssueOrPullRequest, SearchedIssue } from '../../git/models/issue';
 import type {
@@ -19,6 +20,7 @@ import { showIntegrationDisconnectedTooManyFailedRequestsWarningMessage } from '
 import { configuration } from '../../system/configuration';
 import { gate } from '../../system/decorators/gate';
 import { debug, log } from '../../system/decorators/log';
+import { first } from '../../system/iterable';
 import { Logger } from '../../system/logger';
 import type { LogScope } from '../../system/logger.scope';
 import { getLogScope } from '../../system/logger.scope';
@@ -27,7 +29,9 @@ import type {
 	IntegrationAuthenticationService,
 	IntegrationAuthenticationSessionDescriptor,
 } from './authentication/integrationAuthentication';
+import { CloudIntegrationAuthenticationProvider } from './authentication/integrationAuthentication';
 import type { ProviderAuthenticationSession } from './authentication/models';
+import { isSupportedCloudIntegrationId } from './authentication/models';
 import type {
 	GetIssuesOptions,
 	GetPullRequestsOptions,
@@ -135,10 +139,28 @@ export abstract class IntegrationBase<
 	}
 
 	@log()
-	async connect(): Promise<boolean> {
+	async connect(source?: Sources): Promise<boolean> {
 		try {
-			const session = await this.ensureSession(true);
-			return Boolean(session);
+			// Some integrations does not require managmement of Cloud Integrations (e.g. GitHub that can take a built-in VS Code session),
+			// therefore we try to connect them right away.
+			// Only if our attempt fails, we fall to manageCloudIntegrations flow.
+			let connected = Boolean(await this.ensureSession(true));
+			if (!connected) {
+				if (isSupportedCloudIntegrationId(this.id)) {
+					await this.container.integrations.manageCloudIntegrations(
+						{ integrationId: this.id, skipIfConnected: true },
+						{
+							source: source || 'integrations',
+							detail: {
+								action: 'connect',
+								integration: this.id,
+							},
+						},
+					);
+					connected = Boolean(await this.ensureSession(true));
+				}
+			}
+			return connected;
 		} catch (ex) {
 			return false;
 		}
@@ -148,7 +170,11 @@ export abstract class IntegrationBase<
 
 	@gate()
 	@log()
-	async disconnect(options?: { silent?: boolean; currentSessionOnly?: boolean }): Promise<void> {
+	async disconnect(options?: {
+		silent?: boolean;
+		currentSessionOnly?: boolean;
+		cloudSessionOnly?: boolean;
+	}): Promise<void> {
 		if (options?.currentSessionOnly && this._session === null) return;
 
 		const connected = this._session != null;
@@ -184,11 +210,28 @@ export abstract class IntegrationBase<
 		}
 
 		if (signOut) {
-			void this.authenticationService.deleteSession(this.authProvider.id, this.authProviderDescriptor);
+			const authProvider = await this.authenticationService.get(this.authProvider.id);
+			if (options?.cloudSessionOnly && authProvider instanceof CloudIntegrationAuthenticationProvider) {
+				void authProvider.deleteCloudSession(this.authProviderDescriptor);
+			} else {
+				void authProvider.deleteSession(this.authProviderDescriptor);
+			}
 		}
 
 		this.resetRequestExceptionCount();
 		this._session = null;
+
+		if (connected && options?.cloudSessionOnly) {
+			const authProvider = await this.authenticationService.get(this.authProvider.id);
+			this._session = await authProvider.getSession(this.authProviderDescriptor, {
+				createIfNeeded: false,
+				forceNewSession: false,
+			});
+		}
+
+		if (this._session != null) {
+			return;
+		}
 
 		if (connected) {
 			// Don't store the disconnected flag if this only for this current VS Code session (will be re-connected on next restart)
@@ -268,7 +311,8 @@ export abstract class IntegrationBase<
 
 		let session: ProviderAuthenticationSession | undefined | null;
 		try {
-			session = await this.authenticationService.getSession(this.authProvider.id, this.authProviderDescriptor, {
+			const authProvider = await this.authenticationService.get(this.authProvider.id);
+			session = await authProvider.getSession(this.authProviderDescriptor, {
 				createIfNeeded: createIfNeeded,
 				forceNewSession: forceNewSession,
 			});
@@ -390,7 +434,7 @@ export abstract class IntegrationBase<
 
 		const { expiryOverride, ...opts } = options ?? {};
 
-		const currentAccount = this.container.cache.getCurrentAccount(
+		const currentAccount = await this.container.cache.getCurrentAccount(
 			this,
 			() => ({
 				value: (async () => {
@@ -580,7 +624,7 @@ export abstract class HostingIntegration<
 		options?: {
 			avatarSize?: number;
 		},
-	): Promise<Account | undefined> {
+	): Promise<Account | UnidentifiedAuthor | undefined> {
 		const scope = getLogScope();
 
 		const connected = this.maybeConnected ?? (await this.isConnected());
@@ -602,7 +646,7 @@ export abstract class HostingIntegration<
 		options?: {
 			avatarSize?: number;
 		},
-	): Promise<Account | undefined>;
+	): Promise<Account | UnidentifiedAuthor | undefined>;
 
 	@debug()
 	async getDefaultBranch(repo: T): Promise<DefaultBranch | undefined> {
@@ -670,7 +714,7 @@ export abstract class HostingIntegration<
 	): Promise<RepositoryMetadata | undefined>;
 
 	async mergePullRequest(
-		pr: PullRequest | { id: string; headRefSha: string },
+		pr: PullRequest,
 		options?: {
 			mergeMethod?: PullRequestMergeMethod;
 		},
@@ -691,7 +735,7 @@ export abstract class HostingIntegration<
 
 	protected abstract mergeProviderPullRequest(
 		session: ProviderAuthenticationSession,
-		pr: PullRequest | { id: string; headRefSha: string },
+		pr: PullRequest,
 		options?: {
 			mergeMethod?: PullRequestMergeMethod;
 		},
@@ -821,7 +865,7 @@ export abstract class HostingIntegration<
 				return undefined;
 			}
 
-			const organization: string = organizations.values().next().value;
+			const organization: string = first(organizations.values())!;
 
 			if (options?.filters != null) {
 				if (!api.providerSupportsIssueFilters(providerId, options.filters)) {
@@ -1032,7 +1076,7 @@ export abstract class HostingIntegration<
 					return undefined;
 				}
 
-				const organization: string = organizations.values().next().value;
+				const organization: string = first(organizations.values())!;
 				try {
 					userAccount = await api.getCurrentUserForInstance(providerId, organization);
 				} catch (ex) {
@@ -1137,15 +1181,18 @@ export abstract class HostingIntegration<
 	async searchMyPullRequests(
 		repo?: T,
 		cancellation?: CancellationToken,
+		silent?: boolean,
 	): Promise<IntegrationResult<SearchedPullRequest[] | undefined>>;
 	async searchMyPullRequests(
 		repos?: T[],
 		cancellation?: CancellationToken,
+		silent?: boolean,
 	): Promise<IntegrationResult<SearchedPullRequest[] | undefined>>;
 	@debug()
 	async searchMyPullRequests(
 		repos?: T | T[],
 		cancellation?: CancellationToken,
+		silent?: boolean,
 	): Promise<IntegrationResult<SearchedPullRequest[] | undefined>> {
 		const scope = getLogScope();
 		const connected = this.maybeConnected ?? (await this.isConnected());
@@ -1157,6 +1204,7 @@ export abstract class HostingIntegration<
 				this._session!,
 				repos != null ? (Array.isArray(repos) ? repos : [repos]) : undefined,
 				cancellation,
+				silent,
 			);
 			return { value: pullRequests, duration: Date.now() - start };
 		} catch (ex) {
@@ -1169,6 +1217,7 @@ export abstract class HostingIntegration<
 		session: ProviderAuthenticationSession,
 		repos?: T[],
 		cancellation?: CancellationToken,
+		silent?: boolean,
 	): Promise<SearchedPullRequest[] | undefined>;
 
 	async searchPullRequests(

@@ -14,7 +14,7 @@ import type {
 } from '@gitkraken/gitkraken-components';
 import GraphContainer, { CommitDateTimeSources, refZone } from '@gitkraken/gitkraken-components';
 import { VSCodeCheckbox, VSCodeRadio, VSCodeRadioGroup } from '@vscode/webview-ui-toolkit/react';
-import type { FormEvent, ReactElement } from 'react';
+import type { FormEvent, MouseEvent, ReactElement } from 'react';
 import React, { createElement, useEffect, useMemo, useRef, useState } from 'react';
 import { getPlatform } from '@env/platform';
 import type { DateStyle } from '../../../../config';
@@ -62,6 +62,8 @@ import { pluralize } from '../../../../system/string';
 import { createWebviewCommandLink } from '../../../../system/webview';
 import type { IpcNotification } from '../../../protocol';
 import { DidChangeHostWindowFocusNotification } from '../../../protocol';
+import { GlButton } from '../../shared/components/button.react';
+import { CodeIcon } from '../../shared/components/code-icon.react';
 import { MenuDivider, MenuItem, MenuLabel, MenuList } from '../../shared/components/menu/react';
 import { PopMenu } from '../../shared/components/overlays/pop-menu/react';
 import { GlPopover } from '../../shared/components/overlays/popover.react';
@@ -85,7 +87,8 @@ export interface GraphWrapperProps {
 	onColumnsChange?: (colsSettings: GraphColumnsConfig) => void;
 	onDoubleClickRef?: (ref: GraphRef, metadata?: GraphRefMetadataItem) => void;
 	onDoubleClickRow?: (row: GraphRow, preserveFocus?: boolean) => void;
-	onHoverRowPromise?: (row: GraphRow) => Promise<DidGetRowHoverParams | undefined>;
+	onHoverRowPromise?: (row: GraphRow) => Promise<DidGetRowHoverParams>;
+	onJumpToRefPromise?: (alt: boolean) => Promise<{ name: string; sha: string } | undefined>;
 	onMissingAvatars?: (emails: Record<string, string>) => void;
 	onMissingRefsMetadata?: (metadata: GraphMissingRefsMetadata) => void;
 	onMoreRows?: (id?: string) => void;
@@ -210,6 +213,7 @@ export function GraphWrapper({
 	onDoubleClickRow,
 	onEnsureRowPromise,
 	onHoverRowPromise,
+	onJumpToRefPromise,
 	onMissingAvatars,
 	onMissingRefsMetadata,
 	onMoreRows,
@@ -471,8 +475,23 @@ export function GraphWrapper({
 		}
 	};
 
+	const stopColumnResize = () => {
+		const activeResizeElement = document.querySelector('.graph-header .resizable.resizing');
+		if (!activeResizeElement) return;
+
+		// Trigger a mouseup event to reset the column resize state
+		document.dispatchEvent(
+			new MouseEvent('mouseup', {
+				view: window,
+				bubbles: true,
+				cancelable: true,
+			}),
+		);
+	};
+
 	const handleOnGraphMouseLeave = (_event: React.MouseEvent<any>) => {
 		minimap.current?.unselect(undefined, true);
+		stopColumnResize();
 	};
 
 	const handleOnGraphRowHovered = (
@@ -700,6 +719,16 @@ export function GraphWrapper({
 
 	const handleChooseRepository = () => {
 		onChooseRepository?.();
+	};
+
+	const handleJumpToRef = async (e: MouseEvent) => {
+		const ref = await onJumpToRefPromise?.(e.altKey);
+		if (ref != null) {
+			const sha = await ensureSearchResultRow(ref.sha);
+			if (sha == null) return;
+
+			queueMicrotask(() => graphRef.current?.selectCommits([sha], false, true));
+		}
 	};
 
 	const handleFilterChange = (e: Event | FormEvent<HTMLElement>) => {
@@ -1202,6 +1231,14 @@ export function GraphWrapper({
 										</span>
 									</div>
 								</GlPopover>
+								<GlButton appearance="toolbar" onClick={handleJumpToRef}>
+									<CodeIcon icon="target"></CodeIcon>
+									<span slot="tooltip">
+										Jump to HEAD
+										<br />
+										[Alt] Jump to Reference...
+									</span>
+								</GlButton>
 								<span>
 									<span className="codicon codicon-chevron-right"></span>
 								</span>
@@ -1440,6 +1477,22 @@ export function GraphWrapper({
 											</MenuItem>
 											<MenuItem role="none">
 												<VSCodeCheckbox
+													value="pullRequests"
+													onChange={handleOnMinimapAdditionalTypesChange}
+													defaultChecked={
+														graphConfig?.minimapMarkerTypes?.includes('pullRequests') ??
+														true
+													}
+												>
+													<span
+														className="minimap-marker-swatch"
+														data-marker="pullRequests"
+													></span>
+													Pull Requests
+												</VSCodeCheckbox>
+											</MenuItem>
+											<MenuItem role="none">
+												<VSCodeCheckbox
 													value="stashes"
 													onChange={handleOnMinimapAdditionalTypesChange}
 													defaultChecked={
@@ -1489,9 +1542,7 @@ export function GraphWrapper({
 				visible={!allowed}
 			>
 				<p slot="feature">
-					<a href="https://help.gitkraken.com/gitlens/gitlens-features/#commit-graph-%e2%9c%a8">
-						Commit Graph
-					</a>
+					<a href="https://help.gitkraken.com/gitlens/gitlens-features/#commit-graph-pro">Commit Graph</a>
 					<GlFeatureBadge
 						source={{ source: 'graph', detail: 'badge' }}
 						subscription={subscription}
@@ -1509,6 +1560,7 @@ export function GraphWrapper({
 				rowsStats={rowsStats}
 				dataType={graphConfig?.minimapDataType ?? 'commits'}
 				markerTypes={graphConfig?.minimapMarkerTypes}
+				refMetadata={refsMetadata}
 				searchResults={searchResults}
 				visibleDays={visibleDays}
 				onSelected={e => handleOnMinimapDaySelected(e)}

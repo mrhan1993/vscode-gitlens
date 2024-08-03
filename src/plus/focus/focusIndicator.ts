@@ -567,7 +567,7 @@ export class FocusIndicator implements Disposable {
 						const github = await this.container.integrations?.get(HostingIntegrationId.GitHub);
 						if (github == null) break;
 						if (!(github.maybeConnected ?? (await github.isConnected()))) {
-							void github.connect();
+							void github.connect('launchpad-indicator');
 						}
 						break;
 					}

@@ -1,16 +1,21 @@
 import type { AuthenticationSession, Disposable, QuickInputButton } from 'vscode';
 import { env, ThemeIcon, Uri, window } from 'vscode';
-import type {
-	IntegrationAuthenticationProvider,
-	IntegrationAuthenticationSessionDescriptor,
-} from './integrationAuthentication';
+import type { Container } from '../../../container';
+import type { HostingIntegrationId, SelfHostedIntegrationId } from '../providers/models';
+import type { IntegrationAuthenticationSessionDescriptor } from './integrationAuthentication';
+import { LocalIntegrationAuthenticationProvider } from './integrationAuthentication';
 
-export class GitLabAuthenticationProvider implements IntegrationAuthenticationProvider {
-	getSessionId(descriptor?: IntegrationAuthenticationSessionDescriptor): string {
-		return descriptor?.domain ?? '';
+type GitLabId = HostingIntegrationId.GitLab | SelfHostedIntegrationId.GitLabSelfHosted;
+
+export class GitLabAuthenticationProvider extends LocalIntegrationAuthenticationProvider<GitLabId> {
+	constructor(
+		container: Container,
+		protected readonly authProviderId: GitLabId,
+	) {
+		super(container);
 	}
 
-	async createSession(
+	override async createSession(
 		descriptor?: IntegrationAuthenticationSessionDescriptor,
 	): Promise<AuthenticationSession | undefined> {
 		const input = window.createInputBox();
@@ -54,7 +59,9 @@ export class GitLabAuthenticationProvider implements IntegrationAuthenticationPr
 				input.placeholder = `Requires ${descriptor?.scopes.join(', ') ?? 'all'} scopes`;
 				input.prompt = `Paste your [GitLab Personal Access Token](https://${
 					descriptor?.domain ?? 'gitlab.com'
-				}/-/profile/personal_access_tokens "Get your GitLab Access Token")`;
+				}/-/user_settings/personal_access_tokens?name=GitLens+Access+token&scopes=${
+					descriptor?.scopes.join(',') ?? 'all'
+				} "Get your GitLab Access Token")`;
 				input.buttons = [infoButton];
 
 				input.show();

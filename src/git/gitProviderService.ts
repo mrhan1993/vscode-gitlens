@@ -65,7 +65,7 @@ import type { GitGraph } from './models/graph';
 import type { GitLog } from './models/log';
 import type { GitMergeStatus } from './models/merge';
 import type { GitRebaseStatus } from './models/rebase';
-import type { GitBranchReference, GitReference } from './models/reference';
+import type { GitBranchReference, GitReference, GitRevisionRange } from './models/reference';
 import { createRevisionRange, isSha, isUncommitted, isUncommittedParent } from './models/reference';
 import type { GitReflog } from './models/reflog';
 import type { GitRemote } from './models/remote';
@@ -489,7 +489,7 @@ export class GitProviderService implements Disposable {
 		this.fireProvidersChanged([provider]);
 
 		// Don't kick off the discovery if we're still initializing (we'll do it at the end for all "known" providers)
-		if (this._initializing != null) {
+		if (this._initializing == null) {
 			this.onWorkspaceFoldersChanged({ added: workspace.workspaceFolders ?? [], removed: [] });
 		}
 
@@ -1386,10 +1386,7 @@ export class GitProviderService implements Disposable {
 
 	@gate()
 	@log()
-	pull(
-		repoPath: string | Uri,
-		options?: { branch?: GitBranchReference; rebase?: boolean; tags?: boolean },
-	): Promise<void> {
+	pull(repoPath: string | Uri, options?: { rebase?: boolean; tags?: boolean }): Promise<void> {
 		const { provider, path } = this.getProvider(repoPath);
 		return provider.pull(path, options);
 	}
@@ -1461,14 +1458,14 @@ export class GitProviderService implements Disposable {
 		);
 	}
 
-	@log<GitProviderService['getAheadBehindCommitCount']>({ args: { 1: refs => refs.join(',') } })
-	getAheadBehindCommitCount(
+	@log()
+	getLeftRightCommitCount(
 		repoPath: string | Uri,
-		refs: string[],
-		options?: { authors?: GitUser[] | undefined },
-	): Promise<{ ahead: number; behind: number } | undefined> {
+		range: GitRevisionRange,
+		options?: { authors?: GitUser[] | undefined; excludeMerges?: boolean },
+	): Promise<{ left: number; right: number } | undefined> {
 		const { provider, path } = this.getProvider(repoPath);
-		return provider.getAheadBehindCommitCount(path, refs, options);
+		return provider.getLeftRightCommitCount(path, range, options);
 	}
 
 	@log<GitProviderService['getBlame']>({ args: { 1: d => d?.isDirty } })
@@ -1558,7 +1555,7 @@ export class GitProviderService implements Disposable {
 	@log<GitProviderService['getBranchAheadRange']>({ args: { 0: b => b.name } })
 	async getBranchAheadRange(branch: GitBranch): Promise<string | undefined> {
 		if (branch.state.ahead > 0) {
-			return createRevisionRange(branch.upstream?.name, branch.ref);
+			return createRevisionRange(branch.upstream?.name, branch.ref, '..');
 		}
 
 		if (branch.upstream == null) {
@@ -1579,7 +1576,7 @@ export class GitProviderService implements Disposable {
 
 				const possibleBranch = weightedBranch!.branch.upstream?.name ?? weightedBranch!.branch.ref;
 				if (possibleBranch !== branch.ref) {
-					return createRevisionRange(possibleBranch, branch.ref);
+					return createRevisionRange(possibleBranch, branch.ref, '..');
 				}
 			}
 		}
@@ -1858,12 +1855,12 @@ export class GitProviderService implements Disposable {
 	@log()
 	getDiffStatus(
 		repoPath: string | Uri,
-		ref1?: string,
+		ref1OrRange: string | GitRevisionRange,
 		ref2?: string,
 		options?: { filters?: GitDiffFilter[]; path?: string; similarityThreshold?: number },
 	): Promise<GitFile[] | undefined> {
 		const { provider, path } = this.getProvider(repoPath);
-		return provider.getDiffStatus(path, ref1, ref2, options);
+		return provider.getDiffStatus(path, ref1OrRange, ref2, options);
 	}
 
 	@log()
@@ -2318,9 +2315,14 @@ export class GitProviderService implements Disposable {
 
 				const autoRepositoryDetection = configuration.getCore('git.autoRepositoryDetection') ?? true;
 
-				const closed =
+				let closed =
 					options?.closeOnOpen ??
 					(autoRepositoryDetection !== true && autoRepositoryDetection !== 'openEditors');
+				// If we are trying to open a file inside the .git folder, then treat the repository as closed, unless explicitly requested it to be open
+				// This avoids showing the root repo in worktrees during certain operations (e.g. rebase) and vice-versa
+				if (!closed && options?.closeOnOpen !== false && !isDirectory && uri.path.includes('/.git/')) {
+					closed = true;
+				}
 
 				Logger.log(scope, `Repository found in '${repoUri.toString(true)}'`);
 				const repositories = provider.openRepository(root?.folder, repoUri, false, undefined, closed);
@@ -2495,7 +2497,7 @@ export class GitProviderService implements Disposable {
 		return provider.hasBranchOrTag(path, options);
 	}
 
-	@log({ args: { 1: false }, exit: true })
+	@log({ exit: true })
 	async hasCommitBeenPushed(repoPath: string | Uri, ref: string): Promise<boolean> {
 		if (repoPath == null) return false;
 
@@ -2529,6 +2531,14 @@ export class GitProviderService implements Disposable {
 			if (provider.hasUnsafeRepositories?.()) return true;
 		}
 		return false;
+	}
+
+	@log({ exit: true })
+	async isAncestorOf(repoPath: string | Uri, ref1: string, ref2: string): Promise<boolean> {
+		if (repoPath == null) return false;
+
+		const { provider, path } = this.getProvider(repoPath);
+		return provider.isAncestorOf(path, ref1, ref2);
 	}
 
 	@log<GitProviderService['isRepositoryForEditor']>({

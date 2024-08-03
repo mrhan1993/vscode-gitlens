@@ -26,6 +26,7 @@ import {
 } from '../../../git/errors';
 import type { GitDir } from '../../../git/gitProvider';
 import type { GitDiffFilter } from '../../../git/models/diff';
+import type { GitRevisionRange } from '../../../git/models/reference';
 import { isUncommitted, isUncommittedStaged, shortenRevision } from '../../../git/models/reference';
 import type { GitUser } from '../../../git/models/user';
 import { parseGitBranchesDefaultFormat } from '../../../git/parsers/branchParser';
@@ -1022,10 +1023,7 @@ export class Git {
 		}
 	}
 
-	async pull(
-		repoPath: string,
-		options: { branch?: string; remote?: string; upstream?: string; rebase?: boolean; tags?: boolean },
-	): Promise<void> {
+	async pull(repoPath: string, options: { rebase?: boolean; tags?: boolean }): Promise<void> {
 		const params = ['pull'];
 
 		if (options.tags) {
@@ -1034,11 +1032,6 @@ export class Git {
 
 		if (options.rebase) {
 			params.push('-r');
-		}
-
-		if (options.remote && options.branch) {
-			params.push(options.remote);
-			params.push(options.upstream ? `${options.upstream}:${options.branch}` : options.branch);
 		}
 
 		try {
@@ -1077,7 +1070,7 @@ export class Git {
 				reason = PullErrorReason.TagConflict;
 			}
 
-			throw new PullError(reason, ex, options?.branch, options?.remote);
+			throw new PullError(reason, ex);
 		}
 	}
 
@@ -1633,33 +1626,33 @@ export class Git {
 
 	async rev_list__left_right(
 		repoPath: string,
-		refs: string[],
+		range: GitRevisionRange,
 		authors?: GitUser[] | undefined,
-	): Promise<{ ahead: number; behind: number } | undefined> {
+		excludeMerges?: boolean,
+	): Promise<{ left: number; right: number } | undefined> {
 		const params = ['rev-list', '--left-right', '--count'];
 
 		if (authors?.length) {
 			params.push(...authors.map(a => `--author=^${a.name} <${a.email}>$`));
 		}
 
-		const data = await this.git<string>(
-			{ cwd: repoPath, errors: GitErrorHandling.Ignore },
-			...params,
-			...refs,
-			'--',
-		);
+		if (excludeMerges) {
+			params.push('--no-merges');
+		}
+
+		const data = await this.git<string>({ cwd: repoPath, errors: GitErrorHandling.Ignore }, ...params, range, '--');
 		if (data.length === 0) return undefined;
 
 		const parts = data.split('\t');
 		if (parts.length !== 2) return undefined;
 
-		const [ahead, behind] = parts;
+		const [left, right] = parts;
 		const result = {
-			ahead: parseInt(ahead, 10),
-			behind: parseInt(behind, 10),
+			left: parseInt(left, 10),
+			right: parseInt(right, 10),
 		};
 
-		if (isNaN(result.ahead) || isNaN(result.behind)) return undefined;
+		if (isNaN(result.left) || isNaN(result.right)) return undefined;
 
 		return result;
 	}

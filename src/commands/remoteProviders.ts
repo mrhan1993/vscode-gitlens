@@ -92,7 +92,8 @@ export class ConnectRemoteProviderCommand extends Command {
 		const integration = await this.container.integrations.getByRemote(remote);
 		if (integration == null) return false;
 
-		const connected = await integration.connect();
+		const connected = await integration.connect('remoteProvider');
+
 		if (
 			connected &&
 			!(remotes ?? (await this.container.git.getRemotesWithProviders(repoPath))).some(r => r.default)

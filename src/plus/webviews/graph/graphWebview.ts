@@ -19,6 +19,7 @@ import type { CommitSelectedEvent } from '../../../eventBus';
 import { PlusFeatures } from '../../../features';
 import * as BranchActions from '../../../git/actions/branch';
 import {
+	getOrderedComparisonRefs,
 	openAllChanges,
 	openAllChangesIndividually,
 	openAllChangesWithWorking,
@@ -70,6 +71,8 @@ import {
 } from '../../../git/models/repository';
 import type { GitSearch } from '../../../git/search';
 import { getSearchQueryComparisonKey } from '../../../git/search';
+import { splitGitCommitMessage } from '../../../git/utils/commit-utils';
+import { ReferencesQuickPickIncludes, showReferencePicker } from '../../../quickpicks/referencePicker';
 import { showRepositoryPicker } from '../../../quickpicks/repositoryPicker';
 import { executeActionCommand, executeCommand, executeCoreCommand, registerCommand } from '../../../system/command';
 import { configuration } from '../../../system/configuration';
@@ -141,6 +144,7 @@ import type {
 	UpdateSelectionParams,
 } from './protocol';
 import {
+	ChooseRefRequest,
 	ChooseRepositoryCommand,
 	DidChangeAvatarsNotification,
 	DidChangeColumnsNotification,
@@ -227,7 +231,7 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 	private _etagRepository?: number;
 	private _firstSelection = true;
 	private _graph?: GitGraph;
-	private _hoverCache = new Map<string, Promise<string | undefined>>();
+	private _hoverCache = new Map<string, Promise<string>>();
 	private _hoverCancellation: CancellationTokenSource | undefined;
 
 	private readonly _ipcNotificationMap = new Map<IpcNotification<any>, () => Promise<boolean>>([
@@ -474,6 +478,7 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 
 			this.host.registerWebviewCommand('gitlens.graph.compareWithUpstream', this.compareWithUpstream),
 			this.host.registerWebviewCommand('gitlens.graph.compareWithHead', this.compareHeadWith),
+			this.host.registerWebviewCommand('gitlens.graph.compareBranchWithHead', this.compareBranchWithHead),
 			this.host.registerWebviewCommand('gitlens.graph.compareWithWorking', this.compareWorkingWith),
 			this.host.registerWebviewCommand('gitlens.graph.compareWithMergeBase', this.compareWithMergeBase),
 			this.host.registerWebviewCommand(
@@ -539,12 +544,20 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			this.host.registerWebviewCommand('gitlens.graph.scrollMarkerTagOff', () =>
 				this.toggleScrollMarker('tags', false),
 			),
+			this.host.registerWebviewCommand('gitlens.graph.scrollMarkerPullRequestOn', () =>
+				this.toggleScrollMarker('pullRequests', true),
+			),
+			this.host.registerWebviewCommand('gitlens.graph.scrollMarkerPullRequestOff', () =>
+				this.toggleScrollMarker('pullRequests', false),
+			),
 
 			this.host.registerWebviewCommand('gitlens.graph.copyDeepLinkToBranch', this.copyDeepLinkToBranch),
 			this.host.registerWebviewCommand('gitlens.graph.copyDeepLinkToCommit', this.copyDeepLinkToCommit),
 			this.host.registerWebviewCommand('gitlens.graph.copyDeepLinkToRepo', this.copyDeepLinkToRepo),
 			this.host.registerWebviewCommand('gitlens.graph.copyDeepLinkToTag', this.copyDeepLinkToTag),
 			this.host.registerWebviewCommand('gitlens.graph.shareAsCloudPatch', this.shareAsCloudPatch),
+			this.host.registerWebviewCommand('gitlens.graph.createPatch', this.shareAsCloudPatch),
+			this.host.registerWebviewCommand('gitlens.graph.createCloudPatch', this.shareAsCloudPatch),
 
 			this.host.registerWebviewCommand('gitlens.graph.openChangedFiles', this.openFiles),
 			this.host.registerWebviewCommand('gitlens.graph.openOnlyChangedFiles', this.openOnlyChangedFiles),
@@ -622,6 +635,9 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			case ChooseRepositoryCommand.is(e):
 				void this.onChooseRepository();
 				break;
+			case ChooseRefRequest.is(e):
+				void this.onChooseRef(ChooseRefRequest, e);
+				break;
 			case DoubleClickedCommandType.is(e):
 				void this.onDoubleClick(e.params);
 				break;
@@ -693,6 +709,7 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 								case 'remoteBranches':
 								case 'stashes':
 								case 'tags':
+								case 'pullRequests':
 									additionalTypes.push(marker);
 									break;
 							}
@@ -910,7 +927,7 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 	private async onHoverRowRequest<T extends typeof GetRowHoverRequest>(requestType: T, msg: IpcCallMessageType<T>) {
 		const hover: DidGetRowHoverParams = {
 			id: msg.params.id,
-			markdown: undefined,
+			markdown: undefined!,
 		};
 
 		if (this._hoverCancellation != null) {
@@ -958,9 +975,9 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 						});
 					}
 
-					markdown = this.getCommitTooltip(commit, cancellation.token).catch(() => {
+					markdown = this.getCommitTooltip(commit, cancellation.token).catch((ex: unknown) => {
 						this._hoverCache.delete(id);
-						return undefined;
+						throw ex;
 					});
 					if (cache) {
 						this._hoverCache.set(id, markdown);
@@ -969,10 +986,18 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 			}
 
 			if (markdown != null) {
-				hover.markdown = await markdown;
+				try {
+					hover.markdown = {
+						status: 'fulfilled' as const,
+						value: await markdown,
+					};
+				} catch (ex) {
+					hover.markdown = { status: 'rejected' as const, reason: ex };
+				}
 			}
 		}
 
+		hover.markdown ??= { status: 'rejected' as const, reason: new CancellationError() };
 		void this.host.respond(requestType, msg, hover);
 	}
 
@@ -1398,6 +1423,33 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		if (pick == null) return;
 
 		this.repository = pick;
+	}
+
+	async onChooseRef<T extends typeof ChooseRefRequest>(requestType: T, msg: IpcCallMessageType<T>) {
+		if (this.repository == null) {
+			return this.host.respond(requestType, msg, undefined);
+		}
+
+		let pick;
+		// If not alt, then jump directly to HEAD
+		if (!msg.params.alt) {
+			let branch = find(this._graph!.branches.values(), b => b.current);
+			if (branch == null) {
+				branch = await this.repository.getBranch();
+			}
+			if (branch != null) {
+				pick = branch;
+			}
+		} else {
+			pick = await showReferencePicker(
+				this.repository.path,
+				`Jump to Reference ${GlyphChars.Dot} ${this.repository?.name}`,
+				'Choose a reference to jump to',
+				{ include: ReferencesQuickPickIncludes.BranchesAndTags },
+			);
+		}
+
+		return this.host.respond(requestType, msg, pick?.sha != null ? { name: pick.name, sha: pick.sha } : undefined);
 	}
 
 	private _fireSelectionChangedDebounced: Deferrable<GraphWebviewProvider['fireSelectionChanged']> | undefined =
@@ -1968,6 +2020,7 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 				'remoteBranches',
 				'stashes',
 				'tags',
+				'pullRequests',
 			];
 			const enabledScrollMarkerTypes = configuration.get('graph.scrollMarkers.additionalTypes');
 			for (const type of configurableScrollMarkerTypes) {
@@ -2633,11 +2686,15 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 	@log()
 	private async shareAsCloudPatch(item?: GraphItemContext) {
 		const ref = this.getGraphItemRef(item, 'revision') ?? this.getGraphItemRef(item, 'stash');
+
 		if (ref == null) return Promise.resolve();
 
+		const { title, description } = splitGitCommitMessage(ref.message);
 		return executeCommand<CreatePatchCommandArgs>(Commands.CreateCloudPatch, {
 			to: ref.ref,
 			repoPath: ref.repoPath,
+			title: title,
+			description: description,
 		});
 	}
 
@@ -2855,11 +2912,11 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 	}
 
 	@log()
-	private async openPullRequestChanges(item?: GraphItemContext) {
+	private openPullRequestChanges(item?: GraphItemContext) {
 		if (isGraphItemTypedContext(item, 'pullrequest')) {
 			const pr = item.webviewItemValue;
 			if (pr.refs?.base != null && pr.refs.head != null) {
-				const refs = await getComparisonRefsForPullRequest(this.container, pr.repoPath, pr.refs);
+				const refs = getComparisonRefsForPullRequest(pr.repoPath, pr.refs);
 				return openComparisonChanges(
 					this.container,
 					{
@@ -2876,11 +2933,11 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 	}
 
 	@log()
-	private async openPullRequestComparison(item?: GraphItemContext) {
+	private openPullRequestComparison(item?: GraphItemContext) {
 		if (isGraphItemTypedContext(item, 'pullrequest')) {
 			const pr = item.webviewItemValue;
 			if (pr.refs?.base != null && pr.refs.head != null) {
-				const refs = await getComparisonRefsForPullRequest(this.container, pr.repoPath, pr.refs);
+				const refs = getComparisonRefsForPullRequest(pr.repoPath, pr.refs);
 				return this.container.searchAndCompareView.compare(refs.repoPath, refs.head, refs.base);
 			}
 		}
@@ -2919,11 +2976,20 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 	}
 
 	@log()
-	private compareHeadWith(item?: GraphItemContext) {
+	private async compareHeadWith(item?: GraphItemContext) {
 		const ref = this.getGraphItemRef(item);
 		if (ref == null) return Promise.resolve();
 
-		return this.container.searchAndCompareView.compare(ref.repoPath, 'HEAD', ref.ref);
+		const [ref1, ref2] = await getOrderedComparisonRefs(this.container, ref.repoPath, 'HEAD', ref.ref);
+		return this.container.searchAndCompareView.compare(ref.repoPath, ref1, ref2);
+	}
+
+	@log()
+	private compareBranchWithHead(item?: GraphItemContext) {
+		const ref = this.getGraphItemRef(item);
+		if (ref == null) return Promise.resolve();
+
+		return this.container.searchAndCompareView.compare(ref.repoPath, ref.ref, 'HEAD');
 	}
 
 	@log()

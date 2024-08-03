@@ -718,7 +718,7 @@ export class PatchDetailsWebviewProvider
 			this.closeView();
 		} catch (ex) {
 			debugger;
-
+			void this.notifyDidChangeCreateDraftState();
 			void window.showErrorMessage(`Unable to create draft: ${ex.message}`);
 		}
 	}
@@ -816,9 +816,11 @@ export class PatchDetailsWebviewProvider
 
 			const summary = await (
 				await this.container.ai
-			)?.explainCommit(commit, {
-				progress: { location: { viewId: this.host.id } },
-			});
+			)?.explainCommit(
+				commit,
+				{ source: 'patchDetails', type: `draft-${this._context.draft.type}` },
+				{ progress: { location: { viewId: this.host.id } } },
+			);
 			if (summary == null) throw new Error('Error retrieving content');
 
 			params = { summary: summary };
@@ -858,9 +860,11 @@ export class PatchDetailsWebviewProvider
 
 			const summary = await (
 				await this.container.ai
-			)?.generateDraftMessage(repo, {
-				progress: { location: { viewId: this.host.id } },
-			});
+			)?.generateDraftMessage(
+				repo,
+				{ source: 'patchDetails', type: 'patch' },
+				{ progress: { location: { viewId: this.host.id } } },
+			);
 			if (summary == null) throw new Error('Error retrieving content');
 
 			params = extractDraftMessage(summary);

@@ -280,7 +280,7 @@ export class AccountContent extends LitElement {
 				return html`
 					${this.isReactivatedTrial
 						? html`<p>
-								<code-icon icon="rocket"></code-icon>
+								<code-icon icon="megaphone"></code-icon>
 								See
 								<a href="${urls.releaseNotes}">what's new</a>
 								in GitLens.
@@ -295,7 +295,7 @@ export class AccountContent extends LitElement {
 					<button-container>
 						<gl-button full href="command:gitlens.plus.upgrade">Upgrade to Pro</gl-button>
 					</button-container>
-					<p class="special">Special: <b>50% off first seat of Pro</b> — only $4/month!</p>
+					<p class="special">Special: <b>1st seat of Pro is now 50%+ off.</b></p>
 					${this.renderIncludesDevEx()}
 				`;
 			}
@@ -306,7 +306,7 @@ export class AccountContent extends LitElement {
 					<button-container>
 						<gl-button full href="command:gitlens.plus.upgrade">Upgrade to Pro</gl-button>
 					</button-container>
-					<p class="special">Special: <b>50% off first seat of Pro</b> — only $4/month!</p>
+					<p class="special">Special: <b>1st seat of Pro is now 50%+ off.</b></p>
 					${this.renderIncludesDevEx()}
 				`;
 

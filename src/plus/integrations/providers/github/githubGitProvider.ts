@@ -60,8 +60,16 @@ import type {
 import type { GitLog } from '../../../../git/models/log';
 import type { GitMergeStatus } from '../../../../git/models/merge';
 import type { GitRebaseStatus } from '../../../../git/models/rebase';
-import type { GitBranchReference, GitReference } from '../../../../git/models/reference';
-import { createReference, isRevisionRange, isSha, isShaLike, isUncommitted } from '../../../../git/models/reference';
+import type { GitBranchReference, GitReference, GitRevisionRange } from '../../../../git/models/reference';
+import {
+	createReference,
+	createRevisionRange,
+	getRevisionRangeParts,
+	isRevisionRange,
+	isSha,
+	isShaLike,
+	isUncommitted,
+} from '../../../../git/models/reference';
 import type { GitReflog } from '../../../../git/models/reflog';
 import { getRemoteIconUri, getVisibilityCacheKey, GitRemote } from '../../../../git/models/remote';
 import type { RepositoryChangeEvent } from '../../../../git/models/repository';
@@ -87,7 +95,7 @@ import { configuration } from '../../../../system/configuration';
 import { setContext } from '../../../../system/context';
 import { gate } from '../../../../system/decorators/gate';
 import { debug, log } from '../../../../system/decorators/log';
-import { filterMap, first, last, map, some } from '../../../../system/iterable';
+import { filterMap, first, last, map, some, union } from '../../../../system/iterable';
 import { Logger } from '../../../../system/logger';
 import type { LogScope } from '../../../../system/logger.scope';
 import { getLogScope } from '../../../../system/logger.scope';
@@ -527,13 +535,37 @@ export class GitHubGitProvider implements GitProvider, Disposable {
 		}
 	}
 
-	@log<GitHubGitProvider['getAheadBehindCommitCount']>({ args: { 1: refs => refs.join(',') } })
-	async getAheadBehindCommitCount(
-		_repoPath: string,
-		_refs: string[],
-		_options?: { authors?: GitUser[] | undefined },
-	): Promise<{ ahead: number; behind: number } | undefined> {
-		return undefined;
+	@log()
+	async getLeftRightCommitCount(
+		repoPath: string,
+		range: GitRevisionRange,
+		_options?: { authors?: GitUser[] | undefined; excludeMerges?: boolean },
+	): Promise<{ left: number; right: number } | undefined> {
+		if (repoPath == null) return undefined;
+
+		const scope = getLogScope();
+
+		const { metadata, github, session } = await this.ensureRepositoryContext(repoPath);
+
+		try {
+			const result = await github.getComparison(
+				session.accessToken,
+				metadata.repo.owner,
+				metadata.repo.name,
+				stripOrigin(range),
+			);
+
+			if (result == null) return undefined;
+
+			return {
+				left: result.behind_by,
+				right: result.ahead_by,
+			};
+		} catch (ex) {
+			Logger.error(ex, scope);
+			debugger;
+			return undefined;
+		}
 	}
 
 	@gate<GitHubGitProvider['getBlame']>((u, d) => `${u.toString()}|${d?.isDirty}`)
@@ -1010,7 +1042,12 @@ export class GitHubGitProvider implements GitProvider, Disposable {
 		try {
 			const { metadata, github, session } = await this.ensureRepositoryContext(repoPath);
 
-			const commit = await github.getCommit(session.accessToken, metadata.repo.owner, metadata.repo.name, ref);
+			const commit = await github.getCommit(
+				session.accessToken,
+				metadata.repo.owner,
+				metadata.repo.name,
+				stripOrigin(ref),
+			);
 			if (commit == null) return undefined;
 
 			const { viewer = session.account.label } = commit;
@@ -1080,7 +1117,7 @@ export class GitHubGitProvider implements GitProvider, Disposable {
 					metadata.repo.owner,
 					metadata.repo.name,
 					branch,
-					refs,
+					refs.map(stripOrigin),
 					options?.mode ?? 'contains',
 					options?.commitDate,
 				);
@@ -1089,7 +1126,7 @@ export class GitHubGitProvider implements GitProvider, Disposable {
 					session.accessToken,
 					metadata.repo.owner,
 					metadata.repo.name,
-					refs,
+					refs.map(stripOrigin),
 					options?.mode ?? 'contains',
 					options?.commitDate,
 				);
@@ -1116,7 +1153,7 @@ export class GitHubGitProvider implements GitProvider, Disposable {
 				session?.accessToken,
 				metadata.repo.owner,
 				metadata.repo.name,
-				ref,
+				stripOrigin(ref),
 			);
 
 			return count;
@@ -1147,7 +1184,7 @@ export class GitHubGitProvider implements GitProvider, Disposable {
 				session.accessToken,
 				metadata.repo.owner,
 				metadata.repo.name,
-				ref,
+				stripOrigin(ref),
 				file,
 			);
 			if (commit == null) return undefined;
@@ -1627,7 +1664,7 @@ export class GitHubGitProvider implements GitProvider, Disposable {
 				session.accessToken,
 				metadata.repo.owner,
 				metadata.repo.name,
-				ref,
+				stripOrigin(ref),
 				options?.commitDate,
 			);
 
@@ -1754,12 +1791,85 @@ export class GitHubGitProvider implements GitProvider, Disposable {
 
 	@log()
 	async getDiffStatus(
-		_repoPath: string,
-		_ref1?: string,
-		_ref2?: string,
+		repoPath: string,
+		ref1OrRange: string | GitRevisionRange,
+		ref2?: string,
 		_options?: { filters?: GitDiffFilter[]; path?: string; similarityThreshold?: number },
 	): Promise<GitFile[] | undefined> {
-		return undefined;
+		if (repoPath == null) return undefined;
+
+		const scope = getLogScope();
+
+		const { metadata, github, session } = await this.ensureRepositoryContext(repoPath);
+
+		let range: GitRevisionRange;
+		if (isRevisionRange(ref1OrRange)) {
+			range = ref1OrRange;
+
+			if (!isRevisionRange(ref1OrRange, 'qualified')) {
+				const parts = getRevisionRangeParts(ref1OrRange);
+				range = createRevisionRange(parts?.left || 'HEAD', parts?.right || 'HEAD', parts?.notation ?? '...');
+			}
+		} else {
+			range = createRevisionRange(ref1OrRange || 'HEAD', ref2 || 'HEAD', '...');
+		}
+
+		let range2: GitRevisionRange | undefined;
+		// GitHub doesn't support the `..` range notation, so we will need to do some extra work
+		if (isRevisionRange(range, 'qualified-double-dot')) {
+			const parts = getRevisionRangeParts(range)!;
+
+			range = createRevisionRange(parts.left, parts.right, '...');
+			range2 = createRevisionRange(parts.right, parts.left, '...');
+		}
+
+		try {
+			let result = await github.getComparison(
+				session.accessToken,
+				metadata.repo.owner,
+				metadata.repo.name,
+				stripOrigin(range),
+			);
+
+			const files1 = result?.files;
+
+			let files = files1;
+			if (range2) {
+				result = await github.getComparison(
+					session.accessToken,
+					metadata.repo.owner,
+					metadata.repo.name,
+					stripOrigin(range2),
+				);
+
+				const files2 = result?.files;
+
+				files = [...new Set(union(files1, files2))];
+			}
+
+			return files?.map(
+				f =>
+					new GitFileChange(
+						repoPath,
+						f.filename ?? '',
+						fromCommitFileStatus(f.status) ?? GitFileIndexStatus.Modified,
+						f.previous_filename,
+						undefined,
+						// If we need to get a 2nd range, don't include the stats because they won't be correct (for files that overlap)
+						range2
+							? undefined
+							: {
+									additions: f.additions ?? 0,
+									deletions: f.deletions ?? 0,
+									changes: f.changes ?? 0,
+							  },
+					),
+			);
+		} catch (ex) {
+			Logger.error(ex, scope);
+			debugger;
+			return undefined;
+		}
 	}
 
 	@log()
@@ -1800,13 +1910,19 @@ export class GitHubGitProvider implements GitProvider, Disposable {
 			const { metadata, github, session } = await this.ensureRepositoryContext(repoPath);
 
 			const ref = !options?.ref || options.ref === 'HEAD' ? (await metadata.getRevision()).revision : options.ref;
-			const result = await github.getCommits(session.accessToken, metadata.repo.owner, metadata.repo.name, ref, {
-				all: options?.all,
-				authors: options?.authors,
-				after: options?.cursor,
-				limit: limit,
-				since: options?.since ? new Date(options.since) : undefined,
-			});
+			const result = await github.getCommits(
+				session.accessToken,
+				metadata.repo.owner,
+				metadata.repo.name,
+				stripOrigin(ref),
+				{
+					all: options?.all,
+					authors: options?.authors,
+					after: options?.cursor,
+					limit: limit,
+					since: options?.since ? new Date(options.since) : undefined,
+				},
+			);
 
 			const commits = new Map<string, GitCommit>();
 
@@ -2175,13 +2291,19 @@ export class GitHubGitProvider implements GitProvider, Disposable {
 			// }
 
 			const ref = !options?.ref || options.ref === 'HEAD' ? (await metadata.getRevision()).revision : options.ref;
-			const result = await github.getCommits(session.accessToken, metadata.repo.owner, metadata.repo.name, ref, {
-				all: options?.all,
-				after: options?.cursor,
-				path: relativePath,
-				limit: limit,
-				since: options?.since ? new Date(options.since) : undefined,
-			});
+			const result = await github.getCommits(
+				session.accessToken,
+				metadata.repo.owner,
+				metadata.repo.name,
+				stripOrigin(ref),
+				{
+					all: options?.all,
+					after: options?.cursor,
+					path: relativePath,
+					limit: limit,
+					since: options?.since ? new Date(options.since) : undefined,
+				},
+			);
 
 			const commits = new Map<string, GitCommit>();
 
@@ -2346,12 +2468,30 @@ export class GitHubGitProvider implements GitProvider, Disposable {
 
 	@log()
 	async getMergeBase(
-		_repoPath: string,
-		_ref1: string,
-		_ref2: string,
+		repoPath: string,
+		ref1: string,
+		ref2: string,
 		_options: { forkPoint?: boolean },
 	): Promise<string | undefined> {
-		return undefined;
+		if (repoPath == null) return undefined;
+
+		const scope = getLogScope();
+
+		const { metadata, github, session } = await this.ensureRepositoryContext(repoPath);
+
+		try {
+			const result = await github.getComparison(
+				session.accessToken,
+				metadata.repo.owner,
+				metadata.repo.name,
+				createRevisionRange(stripOrigin(ref1), stripOrigin(ref2), '...'),
+			);
+			return result?.merge_base_commit?.sha;
+		} catch (ex) {
+			Logger.error(ex, scope);
+			debugger;
+			return undefined;
+		}
 	}
 
 	// @gate()
@@ -2396,7 +2536,7 @@ export class GitHubGitProvider implements GitProvider, Disposable {
 				metadata.repo.name,
 				revision,
 				relativePath,
-				ref,
+				stripOrigin(ref),
 			);
 
 			return {
@@ -2448,7 +2588,7 @@ export class GitHubGitProvider implements GitProvider, Disposable {
 				session.accessToken,
 				metadata.repo.owner,
 				metadata.repo.name,
-				!ref || ref === 'HEAD' ? (await metadata.getRevision()).revision : ref,
+				stripOrigin(!ref || ref === 'HEAD' ? (await metadata.getRevision()).revision : ref),
 				{
 					path: relativePath,
 					first: offset + skip + 1,
@@ -2818,6 +2958,39 @@ export class GitHubGitProvider implements GitProvider, Disposable {
 		return true;
 	}
 
+	@log()
+	async isAncestorOf(repoPath: string, ref1: string, ref2: string): Promise<boolean> {
+		if (repoPath == null) return false;
+
+		const scope = getLogScope();
+
+		const { metadata, github, session } = await this.ensureRepositoryContext(repoPath);
+
+		try {
+			const result = await github.getComparison(
+				session.accessToken,
+				metadata.repo.owner,
+				metadata.repo.name,
+				createRevisionRange(stripOrigin(ref1), stripOrigin(ref2), '...'),
+			);
+
+			switch (result?.status) {
+				case 'ahead':
+				case 'diverged':
+					return false;
+				case 'identical':
+				case 'behind':
+					return true;
+				default:
+					return false;
+			}
+		} catch (ex) {
+			Logger.error(ex, scope);
+			debugger;
+			return false;
+		}
+	}
+
 	isTrackable(uri: Uri): boolean {
 		return this.supportedSchemes.has(uri.scheme);
 	}
@@ -2885,7 +3058,7 @@ export class GitHubGitProvider implements GitProvider, Disposable {
 			session.accessToken,
 			metadata.repo.owner,
 			metadata.repo.name,
-			ref,
+			stripOrigin(ref),
 			relativePath,
 		);
 
@@ -3513,4 +3686,9 @@ export class GitHubGitProvider implements GitProvider, Disposable {
 
 function encodeAuthority<T>(scheme: string, metadata?: T): string {
 	return `${scheme}${metadata != null ? `+${encodeUtf8Hex(JSON.stringify(metadata))}` : ''}`;
+}
+
+//** Strips `origin/` from a reference or range, because we "fake" origin as the default remote */
+function stripOrigin<T extends string | GitRevisionRange | undefined>(ref: T): T {
+	return ref?.replace(/(?:^|(?<=..))origin\//, '') as T;
 }

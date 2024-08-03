@@ -92,7 +92,12 @@ import type {
 import type { GitLog } from '../../../git/models/log';
 import type { GitMergeStatus } from '../../../git/models/merge';
 import type { GitRebaseStatus } from '../../../git/models/rebase';
-import type { GitBranchReference, GitReference, GitTagReference } from '../../../git/models/reference';
+import type {
+	GitBranchReference,
+	GitReference,
+	GitRevisionRange,
+	GitTagReference,
+} from '../../../git/models/reference';
 import {
 	createReference,
 	getBranchTrackingWithoutRemote,
@@ -1538,26 +1543,11 @@ export class LocalGitProvider implements GitProvider, Disposable {
 
 	@gate()
 	@log()
-	async pull(
-		repoPath: string,
-		options?: { branch?: GitBranchReference; rebase?: boolean; tags?: boolean },
-	): Promise<void> {
+	async pull(repoPath: string, options?: { rebase?: boolean; tags?: boolean }): Promise<void> {
 		const scope = getLogScope();
-
-		let branch = options?.branch;
-		if (!isBranchReference(branch)) {
-			branch = await this.getBranch(repoPath);
-			if (branch == null) return undefined;
-		}
-
-		const [branchName, remoteName] = getBranchNameAndRemote(branch);
-		if (remoteName == null && branch.upstream == null) return undefined;
 
 		try {
 			await this.git.pull(repoPath, {
-				branch: branchName,
-				remote: remoteName,
-				upstream: getBranchTrackingWithoutRemote(branch),
 				rebase: options?.rebase,
 				tags: options?.tags,
 			});
@@ -1685,13 +1675,13 @@ export class LocalGitProvider implements GitProvider, Disposable {
 		}
 	}
 
-	@log<LocalGitProvider['getAheadBehindCommitCount']>({ args: { 1: refs => refs.join(',') } })
-	getAheadBehindCommitCount(
+	@log()
+	getLeftRightCommitCount(
 		repoPath: string,
-		refs: string[],
-		options?: { authors?: GitUser[] | undefined },
-	): Promise<{ ahead: number; behind: number } | undefined> {
-		return this.git.rev_list__left_right(repoPath, refs, options?.authors);
+		range: GitRevisionRange,
+		options?: { authors?: GitUser[] | undefined; excludeMerges?: boolean },
+	): Promise<{ left: number; right: number } | undefined> {
+		return this.git.rev_list__left_right(repoPath, range, options?.authors, options?.excludeMerges);
 	}
 
 	@gate<LocalGitProvider['getBlame']>((u, d) => `${u.toString()}|${d?.isDirty}`)
@@ -2695,6 +2685,7 @@ export class LocalGitProvider implements GitProvider, Disposable {
 							ref: createReference(commit.sha, repoPath, {
 								refType: 'stash',
 								name: stashCommit.name,
+								message: stashCommit.message,
 								number: stashCommit.number,
 							}),
 						},
@@ -3302,12 +3293,12 @@ export class LocalGitProvider implements GitProvider, Disposable {
 	@log()
 	async getDiffStatus(
 		repoPath: string,
-		ref1?: string,
+		ref1OrRange: string | GitRevisionRange,
 		ref2?: string,
 		options?: { filters?: GitDiffFilter[]; path?: string; similarityThreshold?: number },
 	): Promise<GitFile[] | undefined> {
 		try {
-			const data = await this.git.diff__name_status(repoPath, ref1, ref2, {
+			const data = await this.git.diff__name_status(repoPath, ref1OrRange, ref2, {
 				similarityThreshold: configuration.get('advanced.similarityThreshold') ?? undefined,
 				...options,
 			});
@@ -4946,6 +4937,13 @@ export class LocalGitProvider implements GitProvider, Disposable {
 		return this.unsafePaths.size !== 0;
 	}
 
+	@log()
+	async isAncestorOf(repoPath: string, ref1: string, ref2: string): Promise<boolean> {
+		if (repoPath == null) return false;
+
+		return this.git.merge_base__is_ancestor(repoPath, ref1, ref2);
+	}
+
 	isTrackable(uri: Uri): boolean {
 		return this.supportedSchemes.has(uri.scheme);
 	}
@@ -5684,6 +5682,7 @@ export class LocalGitProvider implements GitProvider, Disposable {
 
 		try {
 			await this.git.worktree__add(repoPath, path, options);
+			this.container.events.fire('git:cache:reset', { repoPath: repoPath, caches: ['worktrees'] });
 			if (options?.createBranch) {
 				this.container.events.fire('git:cache:reset', { repoPath: repoPath, caches: ['branches'] });
 			}
@@ -5771,6 +5770,7 @@ export class LocalGitProvider implements GitProvider, Disposable {
 
 		try {
 			await this.git.worktree__remove(repoPath, normalizePath(path), options);
+			this.container.events.fire('git:cache:reset', { repoPath: repoPath, caches: ['worktrees'] });
 		} catch (ex) {
 			Logger.error(ex, scope);
 
